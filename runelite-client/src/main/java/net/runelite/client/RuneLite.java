@@ -30,16 +30,18 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.inject.Guice;
 import com.google.inject.Inject;
 import com.google.inject.Injector;
-import com.openosrs.client.graphics.ModelOutlineRenderer;
 import java.io.File;
 import java.lang.management.ManagementFactory;
 import java.lang.management.RuntimeMXBean;
+import java.net.Authenticator;
+import java.net.PasswordAuthentication;
 import java.nio.file.Paths;
 import java.security.KeyManagementException;
 import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
 import java.util.Locale;
+import java.util.Optional;
 import javax.annotation.Nullable;
 import javax.inject.Provider;
 import javax.inject.Singleton;
@@ -59,35 +61,26 @@ import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.client.account.SessionManager;
-import net.runelite.client.callback.Hooks;
-import net.runelite.client.chat.ChatMessageManager;
-import net.runelite.client.chat.CommandManager;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.discord.DiscordService;
 import net.runelite.client.eventbus.EventBus;
 import net.runelite.client.externalplugins.ExternalPluginManager;
-import net.runelite.client.game.FriendChatManager;
-import net.runelite.client.game.ItemManager;
-import net.runelite.client.game.LootManager;
-import net.runelite.client.game.chatbox.ChatboxPanelManager;
-import net.runelite.client.menus.MenuManager;
+import net.runelite.client.game.WorldService;
 import net.runelite.client.plugins.OPRSExternalPluginManager;
 import net.runelite.client.rs.ClientLoader;
 import net.runelite.client.rs.ClientUpdateCheckMode;
-import net.runelite.client.task.Scheduler;
 import net.runelite.client.ui.ClientUI;
-import net.runelite.client.ui.DrawManager;
 import net.runelite.client.ui.FatalErrorDialog;
 import com.openosrs.client.ui.OpenOSRSSplashScreen;
 import net.runelite.client.ui.SplashScreen;
 import net.runelite.client.ui.overlay.OverlayManager;
-import net.runelite.client.ui.overlay.OverlayRenderer;
 import net.runelite.client.ui.overlay.WidgetOverlay;
-import net.runelite.client.ui.overlay.infobox.InfoBoxManager;
 import net.runelite.client.ui.overlay.tooltip.TooltipOverlay;
 import net.runelite.client.ui.overlay.worldmap.WorldMapOverlay;
-import net.runelite.client.ws.PartyService;
+import net.runelite.client.util.WorldUtil;
 import net.runelite.http.api.RuneLiteAPI;
+import net.runelite.http.api.worlds.World;
+import net.runelite.http.api.worlds.WorldResult;
 import okhttp3.Cache;
 import okhttp3.OkHttpClient;
 import org.slf4j.LoggerFactory;
@@ -126,9 +119,6 @@ public class RuneLite
 	private ConfigManager configManager;
 
 	@Inject
-	private DrawManager drawManager;
-
-	@Inject
 	private SessionManager sessionManager;
 
 	@Inject
@@ -141,31 +131,7 @@ public class RuneLite
 	private ClientUI clientUI;
 
 	@Inject
-	private Provider<InfoBoxManager> infoBoxManager;
-
-	@Inject
 	private OverlayManager overlayManager;
-
-	@Inject
-	private Provider<PartyService> partyService;
-
-	@Inject
-	private Provider<ItemManager> itemManager;
-
-	@Inject
-	private Provider<OverlayRenderer> overlayRenderer;
-
-	@Inject
-	private Provider<FriendChatManager> friendsChatManager;
-
-	@Inject
-	private Provider<ChatMessageManager> chatMessageManager;
-
-	@Inject
-	private Provider<MenuManager> menuManager;
-
-	@Inject
-	private Provider<CommandManager> commandManager;
 
 	@Inject
 	private Provider<TooltipOverlay> tooltipOverlay;
@@ -174,23 +140,11 @@ public class RuneLite
 	private Provider<WorldMapOverlay> worldMapOverlay;
 
 	@Inject
-	private Provider<ModelOutlineRenderer> modelOutlineRenderer;
-
-	@Inject
-	private Provider<LootManager> lootManager;
-
-	@Inject
-	private Provider<ChatboxPanelManager> chatboxPanelManager;
-
-	@Inject
-	private Provider<Hooks> hooks;
+	private WorldService worldService;
 
 	@Inject
 	@Nullable
 	private Client client;
-
-	@Inject
-	private Scheduler scheduler;
 
 	public static void main(String[] args) throws Exception
 	{
@@ -206,6 +160,14 @@ public class RuneLite
 			.withRequiredArg()
 			.withValuesConvertedBy(new ConfigFileConverter())
 			.defaultsTo(DEFAULT_SESSION_FILE);
+
+		final ArgumentAcceptingOptionSpec<String> proxyInfo = parser
+			.accepts("proxy")
+			.withRequiredArg().ofType(String.class);
+
+		final ArgumentAcceptingOptionSpec<Integer> worldInfo = parser
+			.accepts("world")
+			.withRequiredArg().ofType(Integer.class);
 
 		final ArgumentAcceptingOptionSpec<File> configfile = parser.accepts("config", "Use a specified config file")
 			.withRequiredArg()
@@ -239,6 +201,42 @@ public class RuneLite
 		{
 			final Logger logger = (Logger) LoggerFactory.getLogger(Logger.ROOT_LOGGER_NAME);
 			logger.setLevel(Level.DEBUG);
+		}
+
+		if (options.has("proxy"))
+		{
+			String[] proxy = options.valueOf(proxyInfo).split(":");
+
+			if (proxy.length >= 2)
+			{
+				System.setProperty("socksProxyHost", proxy[0]);
+				System.setProperty("socksProxyPort", proxy[1]);
+			}
+
+			if (proxy.length >= 4)
+			{
+				System.setProperty("java.net.socks.username", proxy[2]);
+				System.setProperty("java.net.socks.password", proxy[3]);
+
+				final String user = proxy[2];
+				final char[] pass = proxy[3].toCharArray();
+
+				Authenticator.setDefault(new Authenticator()
+				{
+					private final PasswordAuthentication auth = new PasswordAuthentication(user, pass);
+
+					protected PasswordAuthentication getPasswordAuthentication()
+					{
+						return auth;
+					}
+				});
+			}
+		}
+
+		if (options.has("world"))
+		{
+			int world = options.valueOf(worldInfo);
+			System.setProperty("cli.world", String.valueOf(world));
 		}
 
 		Thread.setDefaultUncaughtExceptionHandler((thread, throwable) ->
@@ -375,27 +373,11 @@ public class RuneLite
 		eventBus.register(pluginManager);
 		eventBus.register(externalPluginManager);
 		eventBus.register(overlayManager);
-		eventBus.register(drawManager);
 		eventBus.register(configManager);
 		eventBus.register(discordService);
 
 		if (!isOutdated)
 		{
-			// Initialize chat colors
-			chatMessageManager.get().loadColors();
-
-			eventBus.register(infoBoxManager.get());
-			eventBus.register(partyService.get());
-			eventBus.register(overlayRenderer.get());
-			eventBus.register(friendsChatManager.get());
-			eventBus.register(itemManager.get());
-			eventBus.register(menuManager.get());
-			eventBus.register(chatMessageManager.get());
-			eventBus.register(commandManager.get());
-			eventBus.register(lootManager.get());
-			eventBus.register(chatboxPanelManager.get());
-			eventBus.register(hooks.get());
-
 			// Add core overlays
 			WidgetOverlay.createOverlays(client).forEach(overlayManager::add);
 			overlayManager.add(worldMapOverlay.get());
@@ -405,15 +387,13 @@ public class RuneLite
 		// Start plugins
 		pluginManager.startPlugins();
 
-		// Register additional schedulers
-		if (this.client != null)
-		{
-			scheduler.registerObject(modelOutlineRenderer.get());
-		}
-
 		SplashScreen.stop();
 
 		clientUI.show();
+
+		//Set the world if specified via CLI args - will not work until clientUI.init is called
+		Optional<Integer> worldArg = Optional.ofNullable(System.getProperty("cli.world")).map(Integer::parseInt);
+		worldArg.ifPresent(this::setWorld);
 	}
 
 	@VisibleForTesting
@@ -458,6 +438,44 @@ public class RuneLite
 		public String valuePattern()
 		{
 			return null;
+		}
+	}
+
+	private void setWorld(int cliWorld)
+	{
+		int correctedWorld = cliWorld < 300 ? cliWorld + 300 : cliWorld;
+
+		if (correctedWorld <= 300 || client.getWorld() == correctedWorld)
+		{
+			return;
+		}
+
+		final WorldResult worldResult = worldService.getWorlds();
+
+		if (worldResult == null)
+		{
+			log.warn("Failed to lookup worlds.");
+			return;
+		}
+
+		final World world = worldResult.findWorld(correctedWorld);
+
+		if (world != null)
+		{
+			final net.runelite.api.World rsWorld = client.createWorld();
+			rsWorld.setActivity(world.getActivity());
+			rsWorld.setAddress(world.getAddress());
+			rsWorld.setId(world.getId());
+			rsWorld.setPlayerCount(world.getPlayers());
+			rsWorld.setLocation(world.getLocation());
+			rsWorld.setTypes(WorldUtil.toWorldTypes(world.getTypes()));
+
+			client.changeWorld(rsWorld);
+			log.debug("Applied new world {}", correctedWorld);
+		}
+		else
+		{
+			log.warn("World {} not found.", correctedWorld);
 		}
 	}
 

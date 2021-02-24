@@ -27,7 +27,6 @@ package net.runelite.client.config;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Strings;
 import com.google.common.collect.ComparisonChain;
-import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.hash.Hasher;
 import com.google.common.hash.Hashing;
@@ -57,7 +56,10 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.Date;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -66,6 +68,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Properties;
 import java.util.Set;
+import java.util.Stack;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
@@ -93,6 +96,7 @@ import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.ClientShutdown;
 import net.runelite.client.events.ConfigChanged;
 import net.runelite.client.events.RuneScapeProfileChanged;
+import net.runelite.client.plugins.OPRSExternalPluginManager;
 import net.runelite.client.util.ColorUtil;
 import net.runelite.http.api.config.ConfigClient;
 import net.runelite.http.api.config.ConfigEntry;
@@ -128,8 +132,9 @@ public class ConfigManager
 	private final Client client;
 
 	private final ConfigInvocationHandler handler = new ConfigInvocationHandler(this);
-	private final Properties properties = new Properties();
 	private final Map<String, String> pendingChanges = new HashMap<>();
+
+	private Properties properties = new Properties();
 
 	// null => we need to make a new profile
 	@Nullable
@@ -159,9 +164,6 @@ public class ConfigManager
 
 	public final void switchSession(AccountSession session)
 	{
-		// Ensure existing config is saved
-		sendConfig();
-
 		if (session == null)
 		{
 			this.session = null;
@@ -170,7 +172,6 @@ public class ConfigManager
 		else
 		{
 			this.session = session;
-			this.configClient = new ConfigClient(okHttpClient, session.getUuid());
 		}
 
 		this.propertiesFile = getPropertiesFile();
@@ -199,75 +200,67 @@ public class ConfigManager
 
 	public void load()
 	{
-		if (configClient == null)
+		loadFromFile();
+	}
+
+	private void swapProperties(Properties newProperties, boolean saveToServer)
+	{
+		Set<Object> allKeys = new HashSet<>(newProperties.keySet());
+
+		Properties oldProperties;
+		synchronized (this)
 		{
-			loadFromFile();
-			return;
+			handler.invalidate();
+			oldProperties = properties;
+			this.properties = newProperties;
 		}
 
-		Configuration configuration;
+		updateRSProfile();
 
-		try
+		allKeys.addAll(oldProperties.keySet());
+
+		for (Object wholeKey : allKeys)
 		{
-			configuration = configClient.get();
-		}
-		catch (IOException ex)
-		{
-			log.debug("Unable to load configuration from client, using saved configuration from disk", ex);
-			loadFromFile();
-			return;
-		}
-
-		if (configuration.getConfig() == null || configuration.getConfig().isEmpty())
-		{
-			log.debug("No configuration from client, using saved configuration on disk");
-			loadFromFile();
-			return;
-		}
-
-		handler.invalidate();
-		properties.clear();
-
-		for (ConfigEntry entry : configuration.getConfig())
-		{
-			log.debug("Loading configuration value from client {}: {}", entry.getKey(), entry.getValue());
-
-			String[] split = splitKey(entry.getKey());
+			String[] split = splitKey((String) wholeKey);
 			if (split == null)
 			{
 				continue;
 			}
 
-			final String groupName = split[KEY_SPLITTER_GROUP];
-			final String profile = split[KEY_SPLITTER_PROFILE];
-			final String key = split[KEY_SPLITTER_KEY];
-			final String value = entry.getValue();
-			final String oldValue = (String) properties.setProperty(entry.getKey(), value);
+			String groupName = split[KEY_SPLITTER_GROUP];
+			String profile = split[KEY_SPLITTER_PROFILE];
+			String key = split[KEY_SPLITTER_KEY];
+			String oldValue = (String) oldProperties.get(wholeKey);
+			String newValue = (String) newProperties.get(wholeKey);
+
+			if (Objects.equals(oldValue, newValue))
+			{
+				continue;
+			}
+
+			log.debug("Loading configuration value {}: {}", wholeKey, newValue);
 
 			ConfigChanged configChanged = new ConfigChanged();
 			configChanged.setGroup(groupName);
 			configChanged.setProfile(profile);
 			configChanged.setKey(key);
 			configChanged.setOldValue(oldValue);
-			configChanged.setNewValue(value);
+			configChanged.setNewValue(newValue);
 			eventBus.post(configChanged);
+
+			if (saveToServer)
+			{
+				synchronized (pendingChanges)
+				{
+					pendingChanges.put((String) wholeKey, newValue);
+				}
+			}
 		}
 
 		migrateConfig();
-
-		try
-		{
-			saveToFile(propertiesFile);
-
-			log.debug("Updated configuration on disk with the latest version");
-		}
-		catch (IOException ex)
-		{
-			log.warn("Unable to update configuration on disk", ex);
-		}
 	}
 
-	private synchronized void syncPropertiesFromFile(File propertiesFile)
+	private void syncPropertiesFromFile(File propertiesFile)
 	{
 		final Properties properties = new Properties();
 		try (FileInputStream in = new FileInputStream(propertiesFile))
@@ -276,44 +269,12 @@ public class ConfigManager
 		}
 		catch (Exception e)
 		{
-			log.debug("Malformed properties, skipping update");
+			log.warn("Malformed properties, skipping update");
 			return;
 		}
 
-		final Map<String, String> copy = (Map) ImmutableMap.copyOf(this.properties);
-		copy.forEach((wholeKey, value) ->
-		{
-			if (!properties.containsKey(wholeKey))
-			{
-				String[] split = splitKey(wholeKey);
-				if (split == null)
-				{
-					return;
-				}
-
-				String groupName = split[KEY_SPLITTER_GROUP];
-				String profile = split[KEY_SPLITTER_PROFILE];
-				String key = split[KEY_SPLITTER_KEY];
-				unsetConfiguration(groupName, profile, key);
-			}
-		});
-
-		properties.forEach((wholeKey, objValue) ->
-		{
-			String[] split = splitKey((String) wholeKey);
-			if (split == null)
-			{
-				return;
-			}
-
-			String groupName = split[KEY_SPLITTER_GROUP];
-			String profile = split[KEY_SPLITTER_PROFILE];
-			String key = split[KEY_SPLITTER_KEY];
-			String value = String.valueOf(objValue);
-			setConfiguration(groupName, profile, key, value);
-		});
-
-		migrateConfig();
+		log.debug("Loading in config from disk for upload");
+		swapProperties(properties, true);
 	}
 
 	public Future<Void> importLocal()
@@ -343,12 +304,10 @@ public class ConfigManager
 
 	private synchronized void loadFromFile()
 	{
-		handler.invalidate();
-		properties.clear();
-
+		Properties newProperties = new Properties();
 		try (FileInputStream in = new FileInputStream(propertiesFile))
 		{
-			properties.load(new InputStreamReader(in, StandardCharsets.UTF_8));
+			newProperties.load(new InputStreamReader(in, StandardCharsets.UTF_8));
 		}
 		catch (FileNotFoundException ex)
 		{
@@ -359,38 +318,8 @@ public class ConfigManager
 			log.warn("Unable to load settings", ex);
 		}
 
-		try
-		{
-			Map<String, String> copy = (Map) ImmutableMap.copyOf(properties);
-			copy.forEach((wholeKey, value) ->
-			{
-				String[] split = splitKey(wholeKey);
-				if (split == null)
-				{
-					log.debug("Properties key malformed!: {}", wholeKey);
-					properties.remove(wholeKey);
-					return;
-				}
-
-				String groupName = split[KEY_SPLITTER_GROUP];
-				String profile = split[KEY_SPLITTER_PROFILE];
-				String key = split[KEY_SPLITTER_KEY];
-
-				ConfigChanged configChanged = new ConfigChanged();
-				configChanged.setGroup(groupName);
-				configChanged.setProfile(profile);
-				configChanged.setKey(key);
-				configChanged.setOldValue(null);
-				configChanged.setNewValue(value);
-				eventBus.post(configChanged);
-			});
-		}
-		catch (Exception ex)
-		{
-			log.warn("Error posting config events", ex);
-		}
-
-		migrateConfig();
+		log.debug("Loading in config from disk");
+		swapProperties(newProperties, false);
 	}
 
 	private void saveToFile(final File propertiesFile) throws IOException
@@ -519,7 +448,11 @@ public class ConfigManager
 
 		assert !key.startsWith(RSPROFILE_GROUP + ".");
 		String wholeKey = getWholeKey(groupName, profile, key);
-		String oldValue = (String) properties.setProperty(wholeKey, value);
+		String oldValue;
+		synchronized (this)
+		{
+			oldValue = (String) properties.setProperty(wholeKey, value);
+		}
 
 		if (Objects.equals(oldValue, value))
 		{
@@ -599,7 +532,11 @@ public class ConfigManager
 	{
 		assert !key.startsWith(RSPROFILE_GROUP + ".");
 		String wholeKey = getWholeKey(groupName, profile, key);
-		String oldValue = (String) properties.remove(wholeKey);
+		String oldValue;
+		synchronized (this)
+		{
+			oldValue = (String) properties.remove(wholeKey);
+		}
 
 		if (oldValue == null)
 		{
@@ -667,6 +604,30 @@ public class ConfigManager
 				.result())
 			.collect(Collectors.toList());
 
+		final List<ConfigTitleDescriptor> titles = Arrays.stream(inter.getDeclaredFields())
+			.filter(m -> m.isAnnotationPresent(ConfigTitle.class) && m.getType() == String.class)
+			.map(m ->
+			{
+				try
+				{
+					return new ConfigTitleDescriptor(
+						String.valueOf(m.get(inter)),
+						m.getDeclaredAnnotation(ConfigTitle.class)
+					);
+				}
+				catch (IllegalAccessException e)
+				{
+					log.warn("Unable to load title {}::{}", inter.getSimpleName(), m.getName());
+					return null;
+				}
+			})
+			.filter(Objects::nonNull)
+			.sorted((a, b) -> ComparisonChain.start()
+				.compare(a.getTitle().position(), b.getTitle().position())
+				.compare(a.getTitle().name(), b.getTitle().name())
+				.result())
+			.collect(Collectors.toList());
+
 		final List<ConfigItemDescriptor> items = Arrays.stream(inter.getMethods())
 			.filter(m -> m.getParameterCount() == 0 && m.isAnnotationPresent(ConfigItem.class))
 			.map(m -> new ConfigItemDescriptor(
@@ -682,7 +643,7 @@ public class ConfigManager
 				.result())
 			.collect(Collectors.toList());
 
-		return new ConfigDescriptor(group, sections, items);
+		return new ConfigDescriptor(group, sections, titles, items);
 	}
 
 	/**
@@ -700,7 +661,7 @@ public class ConfigManager
 			return;
 		}
 
-		for (Method method : clazz.getDeclaredMethods())
+		for (Method method : getAllDeclaredInterfaceMethods(clazz))
 		{
 			ConfigItem item = method.getAnnotation(ConfigItem.class);
 
@@ -768,7 +729,7 @@ public class ConfigManager
 		{
 			return Boolean.parseBoolean(str);
 		}
-		if (type == int.class)
+		if (type == int.class || type == Integer.class)
 		{
 			return Integer.parseInt(str);
 		}
@@ -834,6 +795,41 @@ public class ConfigManager
 		{
 			return Base64.getUrlDecoder().decode(str);
 		}
+		if (type == EnumSet.class)
+		{
+			try
+			{
+				String substring = str.substring(str.indexOf("{") + 1, str.length() - 1);
+				String[] splitStr = substring.split(", ");
+				Class<? extends Enum> enumClass = null;
+				if (!str.contains("{"))
+				{
+					return null;
+				}
+
+				enumClass = findEnumClass(str, OPRSExternalPluginManager.pluginClassLoaders);
+
+				EnumSet enumSet = EnumSet.noneOf(enumClass);
+				for (String s : splitStr)
+				{
+					try
+					{
+						enumSet.add(Enum.valueOf(enumClass, s.replace("[", "").replace("]", "")));
+					}
+					catch (IllegalArgumentException ignore)
+					{
+						return EnumSet.noneOf(enumClass);
+					}
+				}
+				return enumSet;
+			}
+			catch (Exception e)
+			{
+				e.printStackTrace();
+				return null;
+			}
+		}
+
 		return str;
 	}
 
@@ -885,7 +881,36 @@ public class ConfigManager
 		{
 			return Base64.getUrlEncoder().encodeToString((byte[]) object);
 		}
+		if (object instanceof EnumSet)
+		{
+			if (((EnumSet) object).size() == 0)
+			{
+				return getElementType((EnumSet) object).getCanonicalName() + "{}";
+			}
+
+			return ((EnumSet) object).toArray()[0].getClass().getCanonicalName() + "{" + object.toString() + "}";
+		}
+
 		return object == null ? null : object.toString();
+	}
+
+	/**
+	 * Does DFS on a class's interfaces to find all of its implemented methods.
+	 */
+	private Collection<Method> getAllDeclaredInterfaceMethods(Class<?> clazz)
+	{
+		Collection<Method> methods = new HashSet<>();
+		Stack<Class<?>> interfazes = new Stack<>();
+		interfazes.push(clazz);
+
+		while (!interfazes.isEmpty())
+		{
+			Class<?> interfaze = interfazes.pop();
+			Collections.addAll(methods, interfaze.getDeclaredMethods());
+			Collections.addAll(interfazes, interfaze.getInterfaces());
+		}
+
+		return methods;
 	}
 
 	@Subscribe(priority = 100)
@@ -896,6 +921,59 @@ public class ConfigManager
 		{
 			e.waitFor(f);
 		}
+	}
+
+	public static <T extends Enum<T>> Class<T> getElementType(EnumSet<T> enumSet)
+	{
+		if (enumSet.isEmpty())
+		{
+			enumSet = EnumSet.complementOf(enumSet);
+		}
+		return enumSet.iterator().next().getDeclaringClass();
+	}
+
+	public static Class<? extends Enum> findEnumClass(String clasz, ArrayList<ClassLoader> classLoaders)
+	{
+		StringBuilder transformedString = new StringBuilder();
+		for (ClassLoader cl : classLoaders)
+		{
+			try
+			{
+				String[] strings = clasz.substring(0, clasz.indexOf("{")).split("\\.");
+				int i = 0;
+				while (i != strings.length)
+				{
+					if (i == 0)
+					{
+						transformedString.append(strings[i]);
+					}
+					else if (i == strings.length - 1)
+					{
+						transformedString.append("$").append(strings[i]);
+					}
+					else
+					{
+						transformedString.append(".").append(strings[i]);
+					}
+					i++;
+				}
+				return (Class<? extends Enum>) cl.loadClass(transformedString.toString());
+			}
+			catch (Exception e2)
+			{
+				// Will likely fail a lot
+			}
+			try
+			{
+				return (Class<? extends Enum>) cl.loadClass(clasz.substring(0, clasz.indexOf("{")));
+			}
+			catch (Exception e)
+			{
+				// Will likely fail a lot
+			}
+			transformedString = new StringBuilder();
+		}
+		throw new RuntimeException("Failed to find Enum for " + clasz.substring(0, clasz.indexOf("{")));
 	}
 
 	@Nullable
@@ -977,6 +1055,7 @@ public class ConfigManager
 			salt = new byte[15];
 			new SecureRandom()
 				.nextBytes(salt);
+			log.info("creating new salt as there is no existing one {}", Base64.getUrlEncoder().encodeToString(salt));
 			setConfiguration(RSPROFILE_GROUP, RSPROFILE_LOGIN_SALT, salt);
 		}
 
@@ -1013,7 +1092,7 @@ public class ConfigManager
 			String keyStr = RSPROFILE_GROUP + "." + Base64.getUrlEncoder().encodeToString(key);
 			if (!keys.contains(keyStr))
 			{
-				log.info("creating new profile {} for user {}", key, username);
+				log.info("creating new profile {} for user {} ({}) salt {}", keyStr, username, type, Base64.getUrlEncoder().encodeToString(salt));
 
 				setConfiguration(RSPROFILE_GROUP, keyStr, RSPROFILE_LOGIN_HASH, loginHash);
 				setConfiguration(RSPROFILE_GROUP, keyStr, RSPROFILE_TYPE, type);
@@ -1071,6 +1150,7 @@ public class ConfigManager
 
 	/**
 	 * Split a config key into (group, profile, key)
+	 *
 	 * @param key in form group.(rsprofile.profile.)?key
 	 * @return an array of {group, profile, key}
 	 */

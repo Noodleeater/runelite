@@ -24,20 +24,32 @@
  */
 package net.runelite.client.plugins.config;
 
+import com.google.common.base.Splitter;
 import com.google.common.base.Strings;
 import com.google.common.collect.ComparisonChain;
 import com.google.common.primitives.Ints;
+import java.awt.BasicStroke;
 import java.awt.BorderLayout;
 import java.awt.Color;
 import java.awt.Component;
+import java.awt.Container;
 import java.awt.Dimension;
+import java.awt.Font;
+import java.awt.Graphics;
+import java.awt.Graphics2D;
+import java.awt.GridLayout;
 import java.awt.event.FocusAdapter;
 import java.awt.event.FocusEvent;
 import java.awt.event.ItemEvent;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.awt.image.BufferedImage;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.EnumSet;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
 import javax.inject.Inject;
@@ -54,11 +66,13 @@ import javax.swing.JOptionPane;
 import javax.swing.JPanel;
 import javax.swing.JPasswordField;
 import javax.swing.JScrollPane;
+import javax.swing.JSeparator;
 import javax.swing.JSpinner;
 import javax.swing.JTextArea;
 import javax.swing.ScrollPaneConstants;
 import javax.swing.SpinnerModel;
 import javax.swing.SpinnerNumberModel;
+import javax.swing.SwingConstants;
 import javax.swing.SwingUtilities;
 import javax.swing.border.CompoundBorder;
 import javax.swing.border.EmptyBorder;
@@ -76,6 +90,8 @@ import net.runelite.client.config.ConfigManager;
 import net.runelite.client.config.ConfigObject;
 import net.runelite.client.config.ConfigSection;
 import net.runelite.client.config.ConfigSectionDescriptor;
+import net.runelite.client.config.ConfigTitle;
+import net.runelite.client.config.ConfigTitleDescriptor;
 import net.runelite.client.config.Keybind;
 import net.runelite.client.config.ModifierlessKeybind;
 import net.runelite.client.config.Range;
@@ -86,6 +102,7 @@ import net.runelite.client.events.ExternalPluginsChanged;
 import net.runelite.client.events.PluginChanged;
 import net.runelite.client.externalplugins.ExternalPluginManager;
 import net.runelite.client.externalplugins.ExternalPluginManifest;
+import net.runelite.client.plugins.OPRSExternalPluginManager;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginManager;
 import net.runelite.client.ui.ColorScheme;
@@ -97,7 +114,9 @@ import net.runelite.client.ui.components.ComboBoxListRenderer;
 import net.runelite.client.ui.components.colorpicker.ColorPickerManager;
 import net.runelite.client.ui.components.colorpicker.RuneliteColorPicker;
 import net.runelite.client.util.ColorUtil;
+import net.runelite.client.util.DeferredDocumentChangedListener;
 import net.runelite.client.util.ImageUtil;
+import net.runelite.client.util.LinkBrowser;
 import net.runelite.client.util.SwingUtil;
 import net.runelite.client.util.Text;
 
@@ -129,6 +148,9 @@ class ConfigPanel extends PluginPanel
 
 	@Inject
 	private ExternalPluginManager externalPluginManager;
+
+	@Inject
+	private OPRSExternalPluginManager oprsExternalPluginManager;
 
 	@Inject
 	private ColorPickerManager colorPickerManager;
@@ -255,7 +277,55 @@ class ConfigPanel extends PluginPanel
 
 		ConfigDescriptor cd = pluginConfig.getConfigDescriptor();
 
+		Map<String, Map<String, String>> pluginsInfoMap = oprsExternalPluginManager.getPluginsInfoMap();
+
+		if (pluginConfig.getPlugin() != null && pluginsInfoMap.containsKey(pluginConfig.getPlugin().getClass().getSimpleName()))
+		{
+
+			JPanel infoPanel = new JPanel();
+			infoPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+			infoPanel.setBorder(new EmptyBorder(10, 10, 10, 10));
+			infoPanel.setLayout(new GridLayout(0, 1));
+
+			final Font smallFont = FontManager.getRunescapeSmallFont();
+
+			Map<String, String> pluginInfo = pluginsInfoMap.get(pluginConfig.getPlugin().getClass().getSimpleName());
+
+			JLabel idLabel = new JLabel(htmlLabel("id", pluginInfo.get("id")));
+			idLabel.setFont(smallFont);
+			infoPanel.add(idLabel);
+
+			JLabel versionLabel = new JLabel(htmlLabel("version", pluginInfo.get("version")));
+			versionLabel.setFont(smallFont);
+			infoPanel.add(versionLabel);
+
+			JLabel providerLabel = new JLabel(htmlLabel("provider", pluginInfo.get("provider")));
+			providerLabel.setFont(smallFont);
+			infoPanel.add(providerLabel);
+
+			JButton button = new JButton("Support");
+			button.addActionListener(e -> LinkBrowser.browse(pluginInfo.get("support")));
+
+			JSeparator separator = new JSeparator()
+			{
+				@Override
+				protected void paintComponent(Graphics g)
+				{
+					int width = this.getSize().width;
+					Graphics2D g2 = (Graphics2D) g;
+					g2.setStroke(new BasicStroke(2));
+					g2.setColor(ColorScheme.BRAND_BLUE);
+					g2.drawLine(0, 0, width, 0);
+				}
+			};
+
+			mainPanel.add(infoPanel);
+			mainPanel.add(button);
+			mainPanel.add(separator);
+		}
+
 		final Map<String, JPanel> sectionWidgets = new HashMap<>();
+		final Map<String, JPanel> titleWidgets = new HashMap<>();
 		final Map<ConfigObject, JPanel> topLevelPanels = new TreeMap<>((a, b) ->
 			ComparisonChain.start()
 			.compare(a.position(), b.position())
@@ -323,13 +393,55 @@ class ConfigPanel extends PluginPanel
 			topLevelPanels.put(csd, section);
 		}
 
+		for (ConfigTitleDescriptor ctd : cd.getTitles())
+		{
+			ConfigTitle ct = ctd.getTitle();
+			final JPanel title = new JPanel();
+			title.setLayout(new BoxLayout(title, BoxLayout.Y_AXIS));
+			title.setMinimumSize(new Dimension(PANEL_WIDTH, 0));
+
+			final JPanel sectionHeader = new JPanel();
+			sectionHeader.setLayout(new BorderLayout());
+			sectionHeader.setMinimumSize(new Dimension(PANEL_WIDTH, 0));
+
+			title.add(sectionHeader, BorderLayout.NORTH);
+
+			String name = ct.name();
+			final JLabel sectionName = new JLabel(name);
+			sectionName.setForeground(ColorScheme.BRAND_ORANGE);
+			sectionName.setFont(FontManager.getRunescapeBoldFont());
+			sectionName.setToolTipText("<html>" + name + ":<br>" + ct.description() + "</html>");
+			sectionName.setBorder(new EmptyBorder(0, 0, 3, 1));
+			sectionHeader.add(sectionName, BorderLayout.CENTER);
+
+			final JPanel sectionContents = new JPanel();
+			sectionContents.setLayout(new DynamicGridLayout(0, 1, 0, 5));
+			sectionContents.setMinimumSize(new Dimension(PANEL_WIDTH, 0));
+			sectionContents.setBorder(new EmptyBorder(0, 5, 0, 0));
+			title.add(sectionContents, BorderLayout.SOUTH);
+
+			titleWidgets.put(ctd.getKey(), sectionContents);
+
+			// Allow for sub-sections
+			JPanel section = sectionWidgets.get(ct.section());
+			JPanel titleSection = titleWidgets.get(ct.title());
+
+			if (section != null)
+			{
+				section.add(title);
+			}
+			else if (titleSection != null)
+			{
+				titleSection.add(title);
+			}
+			else
+			{
+				topLevelPanels.put(ctd, title);
+			}
+		}
+
 		for (ConfigItemDescriptor cid : cd.getItems())
 		{
-			if (cid.getItem().hidden())
-			{
-				continue;
-			}
-
 			JPanel item = new JPanel();
 			item.setLayout(new BorderLayout());
 			item.setMinimumSize(new Dimension(PANEL_WIDTH, 0));
@@ -339,6 +451,7 @@ class ConfigPanel extends PluginPanel
 			configEntryName.setToolTipText("<html>" + name + ":<br>" + cid.getItem().description() + "</html>");
 			PluginListItem.addLabelPopupMenu(configEntryName, createResetMenuItem(pluginConfig, cid));
 			item.add(configEntryName, BorderLayout.CENTER);
+			item.setName(cid.getItem().keyName());
 
 			if (cid.getType() == Button.class)
 			{
@@ -431,7 +544,31 @@ class ConfigPanel extends PluginPanel
 					}
 				});
 
-				item.add(textField, BorderLayout.SOUTH);
+				if (cid.getItem().parse())
+				{
+					JLabel parsingLabel = new JLabel();
+					parsingLabel.setHorizontalAlignment(SwingConstants.CENTER);
+					parsingLabel.setPreferredSize(new Dimension(PANEL_WIDTH, 15));
+
+					DeferredDocumentChangedListener listener = new DeferredDocumentChangedListener();
+					listener.addChangeListener(e ->
+					{
+						if (cid.getItem().parse())
+						{
+							parseLabel(cid.getItem(), parsingLabel, textField.getText());
+						}
+					});
+					textField.getDocument().addDocumentListener(listener);
+
+					item.add(textField, BorderLayout.CENTER);
+
+					parseLabel(cid.getItem(), parsingLabel, textField.getText());
+					item.add(parsingLabel, BorderLayout.SOUTH);
+				}
+				else
+				{
+					item.add(textField, BorderLayout.SOUTH);
+				}
 			}
 
 			if (cid.getType() == Color.class)
@@ -566,14 +703,51 @@ class ConfigPanel extends PluginPanel
 				item.add(button, BorderLayout.EAST);
 			}
 
-			JPanel section = sectionWidgets.get(cid.getItem().section());
-			if (section == null)
+			if (cid.getType() == EnumSet.class)
 			{
-				topLevelPanels.put(cid, item);
+				Class enumType = cid.getItem().enumClass();
+
+				EnumSet enumSet = configManager.getConfiguration(cd.getGroup().value(),
+					cid.getItem().keyName(), EnumSet.class);
+				if (enumSet == null || enumSet.contains(null))
+				{
+					enumSet = EnumSet.noneOf(enumType);
+				}
+
+				JPanel enumsetLayout = new JPanel(new GridLayout(0, 2));
+				List<JCheckBox> jcheckboxes = new ArrayList<>();
+
+				for (Object obj : enumType.getEnumConstants())
+				{
+					String option = String.valueOf(obj).toLowerCase().replace("_", " ");
+
+					JCheckBox checkbox = new JCheckBox(option);
+					checkbox.setBackground(ColorScheme.LIGHT_GRAY_COLOR);
+					checkbox.setSelected(enumSet.contains(obj));
+					jcheckboxes.add(checkbox);
+
+					enumsetLayout.add(checkbox);
+				}
+
+				jcheckboxes.forEach(checkbox -> checkbox.addActionListener(ae -> changeConfiguration(jcheckboxes, cd, cid)));
+
+				item.add(enumsetLayout, BorderLayout.SOUTH);
+			}
+
+			JPanel section = sectionWidgets.get(cid.getItem().section());
+			JPanel title = titleWidgets.get(cid.getItem().title());
+
+			if (section != null)
+			{
+				section.add(item);
+			}
+			else if (title != null)
+			{
+				title.add(item);
 			}
 			else
 			{
-				section.add(item);
+				topLevelPanels.put(cid, item);
 			}
 		}
 
@@ -606,7 +780,72 @@ class ConfigPanel extends PluginPanel
 		backButton.addActionListener(e -> pluginList.getMuxer().popState());
 		mainPanel.add(backButton);
 
-		revalidate();
+		hideUnhide();
+	}
+
+	private Boolean parse(ConfigItem item, String value)
+	{
+		try
+		{
+			Method parse = item.clazz().getMethod(item.method(), String.class);
+
+			return (boolean) parse.invoke(null, value);
+		}
+		catch (NoSuchMethodException | IllegalAccessException | InvocationTargetException ex)
+		{
+			log.error("Parsing failed: {}", ex.getMessage());
+		}
+
+		return null;
+	}
+
+	private void parseLabel(ConfigItem item, JLabel label, String value)
+	{
+		Boolean result = parse(item, value);
+
+		if (result == null)
+		{
+			label.setForeground(Color.RED);
+			label.setText("Parsing failed");
+		}
+		else if (result)
+		{
+			label.setForeground(Color.GREEN);
+			label.setText("Valid input");
+		}
+		else
+		{
+			label.setForeground(Color.RED);
+			label.setText("Invalid input");
+		}
+	}
+
+	private void changeConfiguration(List<JCheckBox> components, ConfigDescriptor cd, ConfigItemDescriptor cid)
+	{
+		Class<? extends Enum> enumType = cid.getItem().enumClass();
+		EnumSet enumSet = configManager.getConfiguration(cd.getGroup().value(),
+			cid.getItem().keyName(), EnumSet.class);
+		if (enumSet == null)
+		{
+			//noinspection unchecked
+			enumSet = EnumSet.noneOf(enumType);
+		}
+		enumSet.clear();
+
+		EnumSet finalEnumSet = enumSet;
+
+		//noinspection unchecked
+		components.forEach(value ->
+		{
+			if (value.isSelected())
+			{
+				finalEnumSet.add(Enum.valueOf(cid.getItem().enumClass(), String.valueOf(value.getText()).toUpperCase().replace(" ", "_")));
+			}
+		});
+
+		configManager.setConfiguration(cd.getGroup().value(), cid.getItem().keyName(), finalEnumSet);
+
+		hideUnhide();
 	}
 
 	private void changeConfiguration(Component component, ConfigDescriptor cd, ConfigItemDescriptor cid)
@@ -656,6 +895,8 @@ class ConfigPanel extends PluginPanel
 			HotkeyButton hotkeyButton = (HotkeyButton) component;
 			configManager.setConfiguration(cd.getGroup().value(), cid.getItem().keyName(), hotkeyButton.getValue());
 		}
+
+		hideUnhide();
 	}
 
 	@Override
@@ -703,5 +944,112 @@ class ConfigPanel extends PluginPanel
 			rebuild();
 		});
 		return menuItem;
+	}
+
+	private void hideUnhide()
+	{
+		ConfigDescriptor cd = pluginConfig.getConfigDescriptor();
+
+		for (ConfigItemDescriptor cid : cd.getItems())
+		{
+			boolean unhide = cid.getItem().hidden();
+			boolean hide = !cid.getItem().hide().isEmpty();
+
+			if (unhide || hide)
+			{
+				boolean show = false;
+
+				List<String> itemHide = Splitter
+					.onPattern("\\|\\|")
+					.trimResults()
+					.omitEmptyStrings()
+					.splitToList(String.format("%s || %s", cid.getItem().unhide(), cid.getItem().hide()));
+
+				for (ConfigItemDescriptor cid2 : cd.getItems())
+				{
+					if (itemHide.contains(cid2.getItem().keyName()))
+					{
+						if (cid2.getType() == boolean.class)
+						{
+							show = Boolean.parseBoolean(configManager.getConfiguration(cd.getGroup().value(), cid2.getItem().keyName()));
+						}
+						else if (cid2.getType().isEnum())
+						{
+							Class<? extends Enum> type = (Class<? extends Enum>) cid2.getType();
+							try
+							{
+								Enum selectedItem = Enum.valueOf(type, configManager.getConfiguration(cd.getGroup().value(), cid2.getItem().keyName()));
+								if (!cid.getItem().unhideValue().equals(""))
+								{
+									List<String> unhideValue = Splitter
+										.onPattern("\\|\\|")
+										.trimResults()
+										.omitEmptyStrings()
+										.splitToList(cid.getItem().unhideValue());
+
+									show = unhideValue.contains(selectedItem.toString());
+								}
+								else if (!cid.getItem().hideValue().equals(""))
+								{
+									List<String> hideValue = Splitter
+										.onPattern("\\|\\|")
+										.trimResults()
+										.omitEmptyStrings()
+										.splitToList(cid.getItem().hideValue());
+
+									show = !hideValue.contains(selectedItem.toString());
+								}
+							}
+							catch (IllegalArgumentException ignored)
+							{
+							}
+						}
+					}
+				}
+
+				Component comp = findComponentByName(mainPanel, cid.getItem().keyName());
+
+				if (comp != null)
+				{
+					comp.setVisible((!unhide || show) && (!hide || !show));
+				}
+			}
+		}
+
+		revalidate();
+		repaint();
+	}
+
+	private static String htmlLabel(String key, String value)
+	{
+		return "<html><body style = 'color:#a5a5a5'>" + key + ": <span style = 'color:white'>" + value + "</span></body></html>";
+	}
+
+	public static Component findComponentByName(Component component, String componentName)
+	{
+		if (component == null)
+		{
+			return null;
+		}
+
+		if (component.getName() != null && component.getName().equalsIgnoreCase(componentName))
+		{
+			return component;
+		}
+
+		if (component instanceof Container)
+		{
+			Component[] children = ((Container) component).getComponents();
+			for (Component child : children)
+			{
+				Component found = findComponentByName(child, componentName);
+				if (found != null)
+				{
+					return found;
+				}
+			}
+		}
+
+		return null;
 	}
 }
